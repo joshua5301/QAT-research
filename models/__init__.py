@@ -38,12 +38,4 @@ from .shufflenetv2 import cifar100_shufflenetv2_x1_0
 from .shufflenetv2 import cifar100_shufflenetv2_x1_5
 from .shufflenetv2 import cifar100_shufflenetv2_x2_0
 
-from .repvgg import cifar10_repvgg_a0
-from .repvgg import cifar10_repvgg_a1
-from .repvgg import cifar10_repvgg_a2
-
-from .repvgg import cifar100_repvgg_a0
-from .repvgg import cifar100_repvgg_a1
-from .repvgg import cifar100_repvgg_a2
-
 __version__ = "0.1.0-alpha"

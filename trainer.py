@@ -25,18 +25,19 @@ OF SUCH DAMAGE.
 
 import argparse
 import os
-import shutil
+import random
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
+from quant import convert, quant_param_groups
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -61,8 +62,6 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
@@ -73,21 +72,37 @@ parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 5e-4)')
 parser.add_argument('--print-freq', '-p', default=50, type=int,
                     metavar='N', help='print frequency (default: 50)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
-parser.add_argument('--half', dest='half', action='store_true',
-                    help='use half-precision(16-bit) ')
-parser.add_argument('--save-dir', dest='save_dir',
-                    help='The directory used to save the trained models',
-                    default='save_temp', type=str)
-parser.add_argument('--save-every', dest='save_every',
-                    help='Saves checkpoints at every specified number of epochs',
-                    type=int, default=10)
-best_prec1 = 0
+parser.add_argument('--init-from', default='', type=str, metavar='PATH',
+                    help='load weights from a .th/.pt file before training '
+                         '(use to start QAT from your own FP32 baseline)')
+parser.add_argument('--seed', default=0, type=int, metavar='N',
+                    help='random seed (default: 0)')
+
+# --- quantization-aware training (LSQ) ---
+parser.add_argument('--qat', action='store_true',
+                    help='enable LSQ quantization-aware training')
+parser.add_argument('--w-bits', default=4, type=int, metavar='B',
+                    help='weight bits, 0 keeps weights FP32 (default: 4)')
+parser.add_argument('--a-bits', default=4, type=int, metavar='B',
+                    help='activation bits, 0 keeps activations FP32 (default: 4)')
+parser.add_argument('--q-first-last-bits', default=8, type=int, metavar='B',
+                    help='bits for the stem conv and the classifier, 0 leaves '
+                         'them FP32 (default: 8, the LSQ/PACT/DoReFa convention)')
+parser.add_argument('--no-per-channel', dest='q_per_channel', action='store_false',
+                    help='per-tensor weight quantization (default: per-channel)')
+parser.add_argument('--a-signed', default='auto',
+                    choices=['auto', 'always'],
+                    help='activation signedness policy (default: auto)')
+parser.add_argument('--q-init', default='lsq', choices=['lsq', 'minmax'],
+                    help='step-size initialization: lsq = 2<|v|>/sqrt(Qp) '
+                         '(paper, tuned for low bits), minmax = max/Qp '
+                         '(default: lsq)')
+parser.add_argument('--q-step-lr-scale', default=1.0, type=float, metavar='F',
+                    help='LR multiplier for the LSQ step sizes (default: 1.0)')
 
 # cifar100 values are taken verbatim from the recipe that produced the
 # pytorch-cifar-models pretrained weights (conf/cifar100.conf).
@@ -97,34 +112,31 @@ DATASET_STATS = {
 }
 
 
+def load_weights(model, path):
+    obj = torch.load(path, map_location='cpu')
+    state = obj.get('state_dict', obj) if isinstance(obj, dict) else obj
+    if len(state) > 0 and all(k.startswith('module.') for k in state):
+        state = {k[len('module.'):]: v for k, v in state.items()}
+    model.load_state_dict(state)
+    print("=> loaded weights from '{}'".format(path))
+
+
 def main():
-    global args, best_prec1
+    global args
     args = parser.parse_args()
     print('=> {} | {} | available archs: {}'.format(
         args.dataset, args.arch, ' '.join(model_names)))
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
-    # Check the save_dir exists or not
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+    model = getattr(models, f'{args.dataset}_{args.arch}')(pretrained=args.pretrained)
+    if args.init_from:
+        load_weights(model, args.init_from)
 
-    model = torch.nn.DataParallel(
-        getattr(models, f'{args.dataset}_{args.arch}')(pretrained=args.pretrained))
     model.cuda()
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            best_prec1 = checkpoint['best_prec1']
-            model.load_state_dict(checkpoint['state_dict'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.evaluate, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
     cudnn.benchmark = True
 
     dataset_cls = datasets.CIFAR100 if args.dataset == 'cifar100' else datasets.CIFAR10
@@ -148,27 +160,31 @@ def main():
         batch_size=128, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
+    if args.qat:
+        convert(model, w_bits=args.w_bits, a_bits=args.a_bits,
+                first_last_bits=args.q_first_last_bits,
+                per_channel=args.q_per_channel,
+                a_signed=args.a_signed,
+                init_mode=args.q_init)
+        model.cuda()
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    if args.half:
-        model.half()
-        criterion.half()
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    params = quant_param_groups(model, args) if args.qat else model.parameters()
+    optimizer = torch.optim.SGD(params, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay,
                                 nesterov=True)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    for _ in range(args.start_epoch):
-        lr_scheduler.step()
 
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
 
-    for epoch in range(args.start_epoch, args.epochs):
+    best_prec1 = 0
+    for epoch in range(args.epochs):
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
@@ -177,22 +193,10 @@ def main():
 
         # evaluate on validation set
         prec1 = validate(val_loader, model, criterion)
-
-        # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
+        print(' * best so far {:.3f}'.format(best_prec1))
 
-        if epoch > 0 and epoch % args.save_every == 0:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
-
-        save_checkpoint({
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+    print(' * final {:.3f}   best {:.3f}'.format(prec1, best_prec1))
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -217,8 +221,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
         target = target.cuda()
         input_var = input.cuda()
         target_var = target
-        if args.half:
-            input_var = input_var.half()
 
         # compute output
         output = model(input_var)
@@ -271,9 +273,6 @@ def validate(val_loader, model, criterion):
             input_var = input.cuda()
             target_var = target.cuda()
 
-            if args.half:
-                input_var = input_var.half()
-
             # compute output
             output = model(input_var)
             loss = criterion(output, target_var)
@@ -304,12 +303,6 @@ def validate(val_loader, model, criterion):
           .format(top1=top1, top5=top5))
 
     return top1.avg
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    """
-    Save the training model
-    """
-    torch.save(state, filename)
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
