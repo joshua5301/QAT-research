@@ -1,0 +1,12 @@
+# datasets
+data/
+
+# training outputs
+save/
+save_temp/
+*.th
+*.pt
+*.pth
+
+# python
+__pycache__/
