@@ -47,6 +47,9 @@ class LsqQuantizer(nn.Module):
         self.signed = 1 if (is_weight or signed_mode == 'always') else 0
         self._ready = False
 
+        self.cache_round = False    # GridSAM needs (u, step) from the forward
+        self.round_cache = None
+
         self._set_levels()
 
     def _set_levels(self):
@@ -92,5 +95,7 @@ class LsqQuantizer(nn.Module):
         if self.per_channel:
             s = s.view(-1, *([1] * (x.dim() - 1)))
 
-        v = round_pass((x / s).clamp(self.Qn, self.Qp))
-        return v * s
+        u = (x / s).clamp(self.Qn, self.Qp)
+        if self.cache_round:
+            self.round_cache = (u.detach(), s.detach())
+        return round_pass(u) * s

@@ -37,7 +37,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import convert, quant_param_groups
+from quant import convert, quant_param_groups, QuantSAM
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -103,6 +103,10 @@ parser.add_argument('--q-init', default='lsq', choices=['lsq', 'minmax'],
                          '(default: lsq)')
 parser.add_argument('--q-step-lr-scale', default=1.0, type=float, metavar='F',
                     help='LR multiplier for the LSQ step sizes (default: 1.0)')
+parser.add_argument('--sam', action='store_true',
+                    help='QuantSAM: ascent by flipping rounding decisions')
+parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
+                    help='SAM radius (default: 0.05)')
 
 # cifar100 values are taken verbatim from the recipe that produced the
 # pytorch-cifar-models pretrained weights (conf/cifar100.conf).
@@ -178,28 +182,33 @@ def main():
                                 nesterov=True)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    sam = QuantSAM(model, rho=args.sam_rho) if args.sam else None
 
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
 
-    best_prec1 = 0
+    best_prec1, best_prec5 = 0, 0
     for epoch in range(args.epochs):
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, criterion, optimizer, epoch, sam)
         lr_scheduler.step()
 
-        # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
-        best_prec1 = max(prec1, best_prec1)
-        print(' * best so far {:.3f}'.format(best_prec1))
+        # evaluate on validation set; top-5 is reported at the best top-1
+        # epoch, so that both numbers describe the same model
+        prec1, prec5 = validate(val_loader, model, criterion)
+        if prec1 > best_prec1:
+            best_prec1, best_prec5 = prec1, prec5
+        print(' * best so far  Prec@1 {:.3f}  Prec@5 {:.3f}'
+              .format(best_prec1, best_prec5))
 
-    print(' * final {:.3f}   best {:.3f}'.format(prec1, best_prec1))
+    print(' * final  Prec@1 {:.3f}  Prec@5 {:.3f}'.format(prec1, prec5))
+    print(' * best   Prec@1 {:.3f}  Prec@5 {:.3f}'.format(best_prec1, best_prec5))
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, sam=None):
     """
         Run one train epoch
     """
@@ -229,6 +238,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        if sam is not None:
+            # meters keep the clean-weight loss from the first pass
+            sam.ascent_step()
+            optimizer.zero_grad()
+            criterion(model(input_var), target_var).backward()
+            sam.restore()
         optimizer.step()
 
         output = output.float()
@@ -302,7 +317,7 @@ def validate(val_loader, model, criterion):
     print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
           .format(top1=top1, top5=top5))
 
-    return top1.avg
+    return top1.avg, top5.avg
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
