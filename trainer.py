@@ -37,7 +37,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import convert, quant_param_groups, QuantSAM
+from quant import convert, quant_param_groups, QuantSAM, OscProbe
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -110,6 +110,22 @@ parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain'],
                          'gain = first-order loss increase (default: cost)')
 parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
                     help='SAM budget, read per --sam-budget (default: 0.05)')
+parser.add_argument('--osc-probe', action='store_true',
+                    help='log oscillation frequency and amplitude')
+parser.add_argument('--osc-momentum', default=0.01, type=float, metavar='M',
+                    help='EMA momentum for the oscillation probe (default: 0.01)')
+parser.add_argument('--osc-out', default='', type=str, metavar='PATH',
+                    help='write probe history/traces to PATH.npz for plot_osc.py')
+parser.add_argument('--osc-label', default='', type=str,
+                    help='run label used in the figures')
+parser.add_argument('--osc-fig', default='', type=str, metavar='DIR',
+                    help='also render this run figures into DIR at the end')
+parser.add_argument('--osc-trace-epochs', default=5, type=int, metavar='N',
+                    help='trace the rounded levels over the last N epochs (default: 5)')
+parser.add_argument('--osc-trace-layer', default=-1, type=int, metavar='I',
+                    help='quantized layer to trace; -1 picks the middle one')
+parser.add_argument('--osc-top-k', default=5, type=int, metavar='K',
+                    help='oscillating weights to draw in the trace figure (default: 5)')
 
 # cifar100 values are taken verbatim from the recipe that produced the
 # pytorch-cifar-models pretrained weights (conf/cifar100.conf).
@@ -187,6 +203,11 @@ def main():
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     sam = QuantSAM(model, rho=args.sam_rho,
                    budget=args.sam_budget) if args.sam else None
+    probe = OscProbe(
+        model, momentum=args.osc_momentum,
+        trace_steps=args.osc_trace_epochs * len(train_loader),
+        trace_layer=None if args.osc_trace_layer < 0 else args.osc_trace_layer,
+    ) if args.osc_probe else None
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -197,8 +218,10 @@ def main():
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch, sam)
+        train(train_loader, model, criterion, optimizer, epoch, sam, probe)
         lr_scheduler.step()
+        if probe is not None:
+            probe.snapshot()
 
         # evaluate on validation set; top-5 is reported at the best top-1
         # epoch, so that both numbers describe the same model
@@ -208,11 +231,22 @@ def main():
         print(' * best so far  Prec@1 {:.3f}  Prec@5 {:.3f}'
               .format(best_prec1, best_prec5))
 
+    if probe is not None and args.osc_out:
+        label = args.osc_label or os.path.splitext(os.path.basename(args.osc_out))[0]
+        probe.save(args.osc_out, label=label)
+        print('=> wrote oscillation probe to {}'.format(args.osc_out))
+        if args.osc_fig:
+            from plot_osc import make_figures
+            run = (label, np.load(args.osc_out, allow_pickle=True))
+            for p in make_figures([run], args.osc_fig, prefix=label + '_',
+                                  n_show=args.osc_top_k):
+                print('=> {}'.format(p))
+
     print(' * final  Prec@1 {:.3f}  Prec@5 {:.3f}'.format(prec1, prec5))
     print(' * best   Prec@1 {:.3f}  Prec@5 {:.3f}'.format(best_prec1, best_prec5))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, sam=None):
+def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None):
     """
         Run one train epoch
     """
@@ -242,6 +276,7 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        osc = probe.step() if probe is not None else None
         if sam is not None:
             # meters keep the clean-weight loss from the first pass
             sam.ascent_step()
@@ -271,6 +306,8 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1, top5=top5))
+            if osc is not None:
+                print('    ' + OscProbe.format(osc))
 
 
 def validate(val_loader, model, criterion):

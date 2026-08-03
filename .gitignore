@@ -4,6 +4,8 @@ data/
 # training outputs
 save/
 save_temp/
+runs/
+figs/
 *.th
 *.pt
 *.pth
