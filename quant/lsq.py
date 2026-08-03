@@ -49,6 +49,8 @@ class LsqQuantizer(nn.Module):
 
         self.cache_round = False    # GridSAM needs (u, step) from the forward
         self.round_cache = None
+        self.cache_u = False        # dampening needs u with the grid held fixed
+        self.u_cache = None
 
         self._set_levels()
 
@@ -98,4 +100,6 @@ class LsqQuantizer(nn.Module):
         u = (x / s).clamp(self.Qn, self.Qp)
         if self.cache_round:
             self.round_cache = (u.detach(), s.detach())
+        if self.cache_u:
+            self.u_cache = (x / s.detach()).clamp(self.Qn, self.Qp)
         return round_pass(u) * s

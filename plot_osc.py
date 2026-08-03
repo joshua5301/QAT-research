@@ -147,14 +147,48 @@ def fig_summary(runs, args):
     return fig
 
 
+def fig_grid(runs, args):
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.6))
+    for c, (label, d) in enumerate(runs):
+        h = d['hist_grid']
+        tail = max(1, len(h) // 10)
+        p = h[-tail:].mean(0)
+        x = (np.arange(len(p)) + .5) * 0.5 / len(p)
+        u = 1.0 / len(p)
+        axes[0].plot(x, p / u, color=COLORS[c % len(COLORS)], lw=1.6, label=label)
+        axes[1].plot(x, 100 * (p / u - 1), color=COLORS[c % len(COLORS)], lw=1.6,
+                     label=label)
+
+    for ax in axes:
+        ax.axvline(0, color='0.7', lw=.8, ls=':')
+        ax.set_xlabel(r'$|u_i - \mathrm{round}(u_i)|$   (0 = grid point,'
+                      '  0.5 = boundary)', fontsize=8)
+        ax.tick_params(labelsize=8)
+        style(ax)
+    axes[0].axhline(1, color='0.6', lw=.9, ls='--')
+    axes[0].set_ylabel('density / uniform', fontsize=8)
+    axes[0].set_title('distance to the nearest grid point', fontsize=10)
+    axes[0].legend(fontsize=8, frameon=False)
+    axes[1].axhline(0, color='0.6', lw=.9, ls='--')
+    axes[1].set_ylabel('excess over uniform  [%]', fontsize=8)
+    axes[1].set_title('same, relative to uniform', fontsize=10)
+
+    fig.suptitle('clipped weights excluded; averaged over the last %d epochs'
+                 % max(1, len(runs[0][1]['hist_grid']) // 10), fontsize=8, y=.99)
+    fig.tight_layout(rect=[0, 0, 1, .95])
+    return fig
+
+
 def make_figures(runs, out, prefix='', n_show=5, trace_steps=0, pick='base',
                  logy=False):
     args = SimpleNamespace(n_show=n_show, trace_steps=trace_steps, pick=pick,
                            logy=logy)
     os.makedirs(out, exist_ok=True)
+    figs = [('traces', fig_traces(runs, args)), ('summary', fig_summary(runs, args))]
+    if all('hist_grid' in d for _, d in runs):
+        figs.append(('grid', fig_grid(runs, args)))
     paths = []
-    for name, fig in [('traces', fig_traces(runs, args)),
-                      ('summary', fig_summary(runs, args))]:
+    for name, fig in figs:
         stem = os.path.join(out, '%s%s' % (prefix, name))
         for ext in ('pdf', 'png'):
             fig.savefig('%s.%s' % (stem, ext), dpi=200)

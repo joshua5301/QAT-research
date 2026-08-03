@@ -16,11 +16,12 @@ class OscProbe:
     multi  fraction with Var[n] > 0.25, i.e. swings wider than one level
     """
 
-    KEYS = ('freq', 'var', 'margin', 'tight', 'drift', 'multi')
+    KEYS = ('freq', 'var', 'margin', 'tight', 'drift', 'multi', 'clip')
     ALL_KEYS = KEYS + ('amp_w', 'amp_w_rel', 'amp_l')
 
     def __init__(self, model, momentum=0.01, slow_momentum=0.001, tight=0.05,
-                 trace_steps=10000, trace_width=1024, trace_layer=None):
+                 trace_steps=10000, trace_width=1024, trace_layer=None,
+                 grid_bins=64):
         self.mom = momentum
         self.slow_mom = slow_momentum
         self.tight = tight
@@ -34,6 +35,7 @@ class OscProbe:
 
         self.history = []
         self._acc, self._n, self.epoch_len = dict.fromkeys(self.ALL_KEYS, 0.0), 0, 0
+        self.grid_bins, self.grid_hist, self._hg = grid_bins, [], None
         self.trace_layer = len(self.layers) // 2 if trace_layer is None else trace_layer
         self.trace_steps, self.trace_width = trace_steps, trace_width
         self.traces, self.trace_idx, self.trace_pos = None, None, 0
@@ -71,6 +73,11 @@ class OscProbe:
             gain = (m.weight.grad * s).abs()
             margin = (u - u.floor() - 0.5).abs()
 
+            # distance to the nearest grid point, in units of s; clipped
+            # weights sit exactly on one and would fake a spike at 0
+            clip = (u <= m.wq.Qn) | (u >= m.wq.Qp)
+            self._grid((u - n).abs().masked_fill_(clip, -1.0))
+
             rows.append(torch.stack([
                 st['f'].sum(),
                 var.sum(),
@@ -78,6 +85,7 @@ class OscProbe:
                 (margin < self.tight).to(n.dtype).sum(),
                 (st['mu'] - st['slow']).abs().sum(),
                 (var > 0.25).to(n.dtype).sum(),
+                clip.to(n.dtype).sum(),
                 (s.square() * var).sum(),
                 (gain.square() * var).sum(),
                 (n * s).square().sum(),
@@ -98,6 +106,10 @@ class OscProbe:
         self._n += 1
         return out
 
+    def _grid(self, d):
+        h = torch.histc(d, self.grid_bins, 0.0, 0.5)
+        self._hg = h if self._hg is None else self._hg + h
+
     def _trace(self, n):
         flat = n.flatten()
         if self.traces is None:
@@ -111,8 +123,10 @@ class OscProbe:
     def snapshot(self):
         if self._n:
             self.history.append({k: v / self._n for k, v in self._acc.items()})
+            self.grid_hist.append((self._hg / self._hg.sum()).cpu().numpy())
             self._acc, self._n, self.epoch_len = \
                 dict.fromkeys(self.ALL_KEYS, 0.0), 0, self._n
+            self._hg = None
 
     @torch.no_grad()
     def save(self, path, label='', bins=128, vmax=0.5):
@@ -135,6 +149,7 @@ class OscProbe:
                  hist_var=torch.histc(var, bins, 0, vmax).cpu().numpy(),
                  n_weights=float(f.numel()),
                  traces=tr.cpu().numpy(),
+                 hist_grid=np.stack(self.grid_hist),
                  **{k: np.float32([h[k] for h in self.history])
                     for k in self.ALL_KEYS})
 
@@ -142,5 +157,6 @@ class OscProbe:
     def format(st):
         return ('osc: freq {freq:.4f} var {var:.4f} | ampW {amp_w:.3f} '
                 '({amp_w_rel:.4f}) ampL {amp_l:.4f} | margin {margin:.3f} '
-                'tight {tight:.4f} | drift {drift:.4f} multi {multi:.5f}'
+                'tight {tight:.4f} clip {clip:.4f} | drift {drift:.4f} '
+                'multi {multi:.5f}'
                 .format(**st))

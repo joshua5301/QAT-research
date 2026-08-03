@@ -37,7 +37,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import convert, quant_param_groups, QuantSAM, OscProbe
+from quant import convert, quant_param_groups, QuantSAM, Dampen, OscProbe
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -110,6 +110,15 @@ parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain'],
                          'gain = first-order loss increase (default: cost)')
 parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
                     help='SAM budget, read per --sam-budget (default: 0.05)')
+parser.add_argument('--dampen', action='store_true',
+                    help='oscillation dampening: pull latent weights to grid points')
+parser.add_argument('--damp-lambda', default=1e-4, type=float, metavar='L',
+                    help='dampening weight at the end of training; the penalty is '
+                         'summed, so retune per model size, and watch clip in the '
+                         'probe log -- clipping zeroes the penalty (default: 1e-4)')
+parser.add_argument('--damp-lambda-start', default=0.0, type=float, metavar='L',
+                    help='dampening weight at epoch 0; cosine ramp to --damp-lambda '
+                         '(default: 0.0)')
 parser.add_argument('--osc-probe', action='store_true',
                     help='log oscillation frequency and amplitude')
 parser.add_argument('--osc-momentum', default=0.01, type=float, metavar='M',
@@ -212,6 +221,8 @@ def main():
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     sam = QuantSAM(model, rho=args.sam_rho,
                    budget=args.sam_budget) if args.sam else None
+    damp = Dampen(model, args.damp_lambda, args.epochs,
+                  lam_start=args.damp_lambda_start) if args.dampen else None
     probe = OscProbe(
         model, momentum=args.osc_momentum,
         trace_steps=args.osc_trace_epochs * len(train_loader),
@@ -232,7 +243,7 @@ def main():
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
-        train(train_loader, model, criterion, optimizer, epoch, sam, probe)
+        train(train_loader, model, criterion, optimizer, epoch, sam, probe, damp)
         lr_scheduler.step()
         if probe is not None:
             probe.snapshot()
@@ -269,7 +280,8 @@ def main():
     print(' * best   Prec@1 {:.3f}  Prec@5 {:.3f}'.format(best_prec1, best_prec5))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None):
+def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None,
+          damp=None):
     """
         Run one train epoch
     """
@@ -299,6 +311,7 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        # before the dampening gradient, so the probe sees the task loss only
         osc = probe.step() if probe is not None else None
         if sam is not None:
             # meters keep the clean-weight loss from the first pass
@@ -306,6 +319,8 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
             optimizer.zero_grad()
             criterion(model(input_var), target_var).backward()
             sam.restore()
+        if damp is not None:
+            damp.penalty(epoch).backward()
         optimizer.step()
 
         output = output.float()
@@ -329,6 +344,9 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1, top5=top5))
+            if damp is not None:
+                print('    damp: lambda {:.4g}  penalty {:.5f}'
+                      .format(damp.weight(epoch), float(damp.last)))
             if osc is not None:
                 print('    ' + OscProbe.format(osc))
 
