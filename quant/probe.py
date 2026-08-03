@@ -116,8 +116,11 @@ class OscProbe:
 
     @torch.no_grad()
     def save(self, path, label='', bins=128, vmax=0.5):
+        import os
+
         import numpy as np
 
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.snapshot()
         f = torch.cat([st['f'].flatten() for st in self.state])
         var = torch.cat([(st['nu'] - st['mu'].square()).clamp(min=0).flatten()

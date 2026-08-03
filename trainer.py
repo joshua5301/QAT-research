@@ -135,6 +135,15 @@ DATASET_STATS = {
 }
 
 
+def check_writable(path):
+    """Fail before training rather than after it."""
+    d = os.path.dirname(os.path.abspath(path)) or '.'
+    os.makedirs(d, exist_ok=True)
+    stamp = os.path.join(d, '.write_check')
+    open(stamp, 'w').close()
+    os.remove(stamp)
+
+
 def load_weights(model, path):
     obj = torch.load(path, map_location='cpu')
     state = obj.get('state_dict', obj) if isinstance(obj, dict) else obj
@@ -209,6 +218,11 @@ def main():
         trace_layer=None if args.osc_trace_layer < 0 else args.osc_trace_layer,
     ) if args.osc_probe else None
 
+    if probe is not None:
+        for p in filter(None, (args.osc_out, args.osc_fig and
+                               os.path.join(args.osc_fig, 'x'))):
+            check_writable(p)
+
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
@@ -233,14 +247,23 @@ def main():
 
     if probe is not None and args.osc_out:
         label = args.osc_label or os.path.splitext(os.path.basename(args.osc_out))[0]
-        probe.save(args.osc_out, label=label)
-        print('=> wrote oscillation probe to {}'.format(args.osc_out))
+        out = args.osc_out
+        try:
+            probe.save(out, label=label)
+        except OSError as e:
+            out = os.path.basename(args.osc_out)
+            print('!! {} failed ({}), falling back to {}'.format(args.osc_out, e, out))
+            probe.save(out, label=label)
+        print('=> wrote oscillation probe to {}'.format(out))
         if args.osc_fig:
-            from plot_osc import make_figures
-            run = (label, np.load(args.osc_out, allow_pickle=True))
-            for p in make_figures([run], args.osc_fig, prefix=label + '_',
-                                  n_show=args.osc_top_k):
-                print('=> {}'.format(p))
+            try:
+                from plot_osc import make_figures
+                run = (label, np.load(out, allow_pickle=True))
+                for p in make_figures([run], args.osc_fig, prefix=label + '_',
+                                      n_show=args.osc_top_k):
+                    print('=> {}'.format(p))
+            except Exception as e:
+                print('!! figures failed ({}); replot from {}'.format(e, out))
 
     print(' * final  Prec@1 {:.3f}  Prec@5 {:.3f}'.format(prec1, prec5))
     print(' * best   Prec@1 {:.3f}  Prec@5 {:.3f}'.format(best_prec1, best_prec5))
