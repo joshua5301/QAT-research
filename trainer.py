@@ -105,8 +105,11 @@ parser.add_argument('--q-step-lr-scale', default=1.0, type=float, metavar='F',
                     help='LR multiplier for the LSQ step sizes (default: 1.0)')
 parser.add_argument('--sam', action='store_true',
                     help='QuantSAM: ascent by flipping rounding decisions')
+parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain'],
+                    help='what --sam-rho caps: cost = ||eps||_2 radius, '
+                         'gain = first-order loss increase (default: cost)')
 parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
-                    help='SAM radius (default: 0.05)')
+                    help='SAM budget, read per --sam-budget (default: 0.05)')
 
 # cifar100 values are taken verbatim from the recipe that produced the
 # pytorch-cifar-models pretrained weights (conf/cifar100.conf).
@@ -182,7 +185,8 @@ def main():
                                 nesterov=True)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    sam = QuantSAM(model, rho=args.sam_rho) if args.sam else None
+    sam = QuantSAM(model, rho=args.sam_rho,
+                   budget=args.sam_budget) if args.sam else None
 
     if args.evaluate:
         validate(val_loader, model, criterion)

@@ -6,9 +6,11 @@ from .modules import QConv2d, QLinear
 
 class QuantSAM:
 
-    def __init__(self, model, rho=0.05):
+    def __init__(self, model, rho=0.05, budget='cost'):
+        assert budget in ('cost', 'gain')
         self.model = model
         self.rho = rho
+        self.budget = budget
 
         self.layers = [m for m in model.modules()
                        if isinstance(m, (QConv2d, QLinear)) and m.wq is not None]
@@ -18,7 +20,8 @@ class QuantSAM:
             m.wq.cache_round = True
 
     def _candidates(self, m):
-        """ratio, cost, flip delta and a validity mask, all weight-shaped."""
+        """ratio, cost, gain, flip delta and a validity mask, all
+        weight-shaped."""
         assert m.wq_out is not None and m.wq_out.grad is not None, \
             'ascent_step() needs a backward pass first'
         u, s = m.wq.round_cache
@@ -29,19 +32,23 @@ class QuantSAM:
         gain = m.wq_out.grad * delta
         cost = ((r - 0.5) * s).square()
         ok = (gain > 0) & (r > 0) & ~(up & (u.floor() >= m.wq.Qp))
-        return gain / cost, cost, delta, ok
+        return gain / cost, cost, gain, delta, ok
 
     @torch.no_grad()
     def ascent_step(self):
         cand = [self._candidates(m) for m in self.layers]
-        ratio = torch.cat([rt[ok] for rt, _, _, ok in cand])
-        cost = torch.cat([c[ok] for _, c, _, ok in cand])
+        ratio = torch.cat([rt[ok] for rt, _, _, _, ok in cand])
 
         order = torch.argsort(ratio, descending=True)
-        k = int((cost[order].cumsum(0) <= self.rho ** 2).sum())
+        if self.budget == 'cost':
+            cost = torch.cat([c[ok] for _, c, _, _, ok in cand])
+            k = int((cost[order].cumsum(0) <= self.rho ** 2).sum())
+        else:
+            gain = torch.cat([g[ok] for _, _, g, _, ok in cand])
+            k = int((gain[order].cumsum(0) <= self.rho).sum())
         cut = ratio[order[k - 1]] if k else None
 
-        for m, (rt, _, delta, ok) in zip(self.layers, cand):
+        for m, (rt, _, _, delta, ok) in zip(self.layers, cand):
             m.eps = None if cut is None else (ok & (rt >= cut)) * delta
         self._freeze_bn(True)
 
