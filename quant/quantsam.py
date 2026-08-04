@@ -7,7 +7,7 @@ from .modules import QConv2d, QLinear
 class QuantSAM:
 
     def __init__(self, model, rho=0.05, budget='cost'):
-        assert budget in ('cost', 'gain')
+        assert budget in ('cost', 'gain', 'count')
         self.model = model
         self.rho = rho
         self.budget = budget
@@ -34,22 +34,34 @@ class QuantSAM:
         ok = (gain > 0) & (r > 0) & ~(up & (u.floor() >= m.wq.Qp))
         return gain / cost, cost, gain, delta, ok
 
+    def _rank(self, c):
+        """The quantity the greedy sorts on.
+
+        Normalizing the ball by T = diag(m), m the distance to the boundary,
+        prices every flip at (m/m)^2 = 1, so the count arm ranks on the gain
+        alone; the other two rank on gain per unit of squared distance.
+        """
+        return c[2] if self.budget == 'count' else c[0]
+
     @torch.no_grad()
     def ascent_step(self):
         cand = [self._candidates(m) for m in self.layers]
-        ratio = torch.cat([rt[ok] for rt, _, _, _, ok in cand])
+        rank = torch.cat([self._rank(c)[c[4]] for c in cand])
 
-        order = torch.argsort(ratio, descending=True)
+        order = torch.argsort(rank, descending=True)
         if self.budget == 'cost':
             cost = torch.cat([c[ok] for _, c, _, _, ok in cand])
             k = int((cost[order].cumsum(0) <= self.rho ** 2).sum())
-        else:
+        elif self.budget == 'gain':
             gain = torch.cat([g[ok] for _, _, g, _, ok in cand])
             k = int((gain[order].cumsum(0) <= self.rho).sum())
-        cut = ratio[order[k - 1]] if k else None
+        else:
+            # uniform price, so the budget is just how many flips fit
+            k = min(int(self.rho ** 2), rank.numel())
+        cut = rank[order[k - 1]] if k else None
 
-        for m, (rt, _, _, delta, ok) in zip(self.layers, cand):
-            m.eps = None if cut is None else (ok & (rt >= cut)) * delta
+        for m, c in zip(self.layers, cand):
+            m.eps = None if cut is None else (c[4] & (self._rank(c) >= cut)) * c[3]
         self._freeze_bn(True)
 
     @torch.no_grad()

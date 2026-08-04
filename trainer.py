@@ -105,13 +105,20 @@ parser.add_argument('--q-step-lr-scale', default=1.0, type=float, metavar='F',
                     help='LR multiplier for the LSQ step sizes (default: 1.0)')
 parser.add_argument('--sam', action='store_true',
                     help='QuantSAM: ascent by flipping rounding decisions')
-parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain'],
-                    help='what --sam-rho caps: cost = ||eps||_2 radius, '
-                         'gain = first-order loss increase (default: cost)')
+parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain', 'count'],
+                    help='radius of which ball --sam-rho is: cost = plain l2 (T=I), '
+                         'gain = its dual, a first-order loss budget, '
+                         'count = l2 after T=diag(m), i.e. rho^2 flips ranked by '
+                         'gain (default: cost)')
 parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
                     help='SAM budget, read per --sam-budget (default: 0.05)')
 parser.add_argument('--dampen', action='store_true',
-                    help='oscillation dampening: pull latent weights to grid points')
+                    help='quadratic pull on the latent weights, see --damp-target')
+parser.add_argument('--damp-target', default='grid', choices=['grid', 'boundary'],
+                    help='what the penalty is minimal on: grid = oscillation '
+                         'dampening, boundary = its reflection, the T=diag(m) '
+                         'shadow of the count arm; a negative --damp-lambda '
+                         'flips either into its opposite (default: grid)')
 parser.add_argument('--damp-lambda', default=1e-4, type=float, metavar='L',
                     help='dampening weight at the end of training; the penalty is '
                          'summed, so retune per model size, and watch clip in the '
@@ -222,7 +229,8 @@ def main():
     sam = QuantSAM(model, rho=args.sam_rho,
                    budget=args.sam_budget) if args.sam else None
     damp = Dampen(model, args.damp_lambda, args.epochs,
-                  lam_start=args.damp_lambda_start) if args.dampen else None
+                  lam_start=args.damp_lambda_start,
+                  target=args.damp_target) if args.dampen else None
     probe = OscProbe(
         model, momentum=args.osc_momentum,
         trace_steps=args.osc_trace_epochs * len(train_loader),
