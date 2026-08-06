@@ -23,20 +23,17 @@ Layers left in FP32 by --q-first-last-bits 0 are not in the ball at all: they
 have no Q(w) to perturb.
 '''
 import torch
-import torch.nn as nn
 
-from ..lsq import LsqQuantizer
 from ..modules import QConv2d, QLinear, freeze_bn
+from .cont import CONT, DEFAULT, continuous_params
 
 
 class SAQ:
 
-    CONT = ('bn', 'bias', 'wscale', 'ascale')
-    DEFAULT = ('bn', 'bias')
+    CONT = CONT
+    DEFAULT = DEFAULT
 
     def __init__(self, model, rho=0.05, cont=DEFAULT):
-        cont = set(cont)
-        assert cont <= set(self.CONT), sorted(cont - set(self.CONT))
         self.model = model
         self.rho = rho
 
@@ -46,21 +43,7 @@ class SAQ:
         for m in self.layers:
             m.sam = True
 
-        self.cont = []
-        for m in model.modules():
-            if isinstance(m, nn.modules.batchnorm._BatchNorm):
-                key = 'bn'
-            elif isinstance(m, LsqQuantizer):
-                key = 'wscale' if m.is_weight else 'ascale'
-            elif isinstance(m, (QConv2d, QLinear)):
-                if 'bias' in cont and m.bias is not None:
-                    self.cont.append(m.bias)
-                continue
-            else:
-                continue
-            if key in cont:
-                self.cont += [p for p in m.parameters(recurse=False)
-                              if p.requires_grad]
+        self.cont = continuous_params(model, cont)
         self._backup = []
 
     @torch.no_grad()

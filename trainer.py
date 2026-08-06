@@ -114,6 +114,11 @@ parser.add_argument('--dsam', action='store_true',
 parser.add_argument('--dsam-rho', default=0.05, type=float, metavar='R',
                     help='first-order loss increase the ascent buys, in nats; '
                          'independent of step size and bit width (default: 0.05)')
+parser.add_argument('--dsam-cont', default='bn,bias', type=str, metavar='LIST',
+                    help='continuous parameter groups sharing the DiscreteSAM '
+                         'budget, comma separated from bn,bias,wscale,ascale; '
+                         'empty flips rounding decisions only (default: bn,bias, '
+                         'matching --saq-cont)')
 parser.add_argument('--saq', action='store_true',
                     help='SAQ: SAM with the perturbation on the quantized weights')
 parser.add_argument('--saq-rho', default=0.05, type=float, metavar='R',
@@ -235,7 +240,8 @@ def main():
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     assert not (args.dsam and args.saq), 'pick one of --dsam / --saq'
-    sam = (DiscreteSAM(model, rho=args.dsam_rho) if args.dsam else
+    sam = (DiscreteSAM(model, rho=args.dsam_rho,
+                       cont=filter(None, args.dsam_cont.split(','))) if args.dsam else
            SAQ(model, rho=args.saq_rho,
                cont=filter(None, args.saq_cont.split(','))) if args.saq else None)
     assert not (args.ooq and args.aoq), 'pick one of --ooq / --aoq'
