@@ -146,9 +146,10 @@ parser.add_argument('--qvr-lambda', default=1.0, type=float, metavar='L',
                     help='weight on the penalty. With --qvr-form std the penalty '
                          'is in nats, so lambda is its rate of exchange against '
                          'the task loss (default: 1.0)')
-parser.add_argument('--qvr-lambda-start', default=None, type=float, metavar='L',
-                    help='cosine-ramp lambda from this value; unset holds it '
-                         'constant (default: unset)')
+parser.add_argument('--qvr-lambda-start', default=0.0, type=float, metavar='L',
+                    help='lambda at epoch 0; cosine-ramped to --qvr-lambda over '
+                         'training. Above it the schedule decays instead, equal '
+                         'to it holds lambda constant (default: 0.0)')
 parser.add_argument('--qvr-form', default='std', choices=['std', 'var'],
                     help='penalize the standard deviation or the variance; std '
                          'keeps a constant pressure as the spread shrinks '

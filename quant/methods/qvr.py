@@ -32,7 +32,7 @@ class QVR:
 
     FORMS = ('std', 'var')
 
-    def __init__(self, model, lam, epochs, lam_start=None, form='std'):
+    def __init__(self, model, lam, epochs, lam_start=0.0, form='std'):
         assert form in self.FORMS, form
         self.lam, self.lam_start, self.epochs = lam, lam_start, epochs
         self.form = form
@@ -45,9 +45,9 @@ class QVR:
         self.last = 0.0
 
     def weight(self, epoch):
-        if self.lam_start is None:
-            return self.lam
-        t = min(epoch / max(self.epochs - 1, 1), 1.0)
+        """Cosine from lam_start to lam. Setting lam_start above lam decays
+        instead; setting them equal holds lambda constant."""
+        t = min(max(epoch / max(self.epochs - 1, 1), 0.0), 1.0)
         return self.lam_start + (self.lam - self.lam_start) * (1 - math.cos(math.pi * t)) / 2
 
     def penalty(self, epoch):
