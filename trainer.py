@@ -37,8 +37,8 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import (convert, quant_param_groups, DiscreteSAM, SAQ, OOQ, AOQ,
-                   FlipProbe)
+from quant import (convert, quant_param_groups, DiscreteSAM, SAQ, OOQ, QVR,
+                   AOQ, FlipProbe)
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -140,6 +140,19 @@ parser.add_argument('--ooq-lambda-start', default=0.0, type=float, metavar='L',
 parser.add_argument('--ooq-anneal-start', default=0.25, type=float, metavar='F',
                     help='fraction of training held at --ooq-lambda-start before '
                          'the cosine ramp begins (default: 0.25, as released)')
+parser.add_argument('--qvr', action='store_true',
+                    help='QVR: penalize the loss spread under rounding, ||m*g||')
+parser.add_argument('--qvr-lambda', default=1.0, type=float, metavar='L',
+                    help='weight on the penalty. With --qvr-form std the penalty '
+                         'is in nats, so lambda is its rate of exchange against '
+                         'the task loss (default: 1.0)')
+parser.add_argument('--qvr-lambda-start', default=None, type=float, metavar='L',
+                    help='cosine-ramp lambda from this value; unset holds it '
+                         'constant (default: unset)')
+parser.add_argument('--qvr-form', default='std', choices=['std', 'var'],
+                    help='penalize the standard deviation or the variance; std '
+                         'keeps a constant pressure as the spread shrinks '
+                         '(default: std)')
 parser.add_argument('--aoq', action='store_true',
                     help='AOQ: contract the grid to explore, release, then dampen')
 parser.add_argument('--aoq-stage', default='0.2,0.6', type=str, metavar='F1,F2',
@@ -244,11 +257,15 @@ def main():
                        cont=filter(None, args.dsam_cont.split(','))) if args.dsam else
            SAQ(model, rho=args.saq_rho,
                cont=filter(None, args.saq_cont.split(','))) if args.saq else None)
-    assert not (args.ooq and args.aoq), 'pick one of --ooq / --aoq'
+    assert sum(map(bool, (args.ooq, args.qvr, args.aoq))) <= 1, \
+        'pick one of --ooq / --qvr / --aoq'
     s1, s2 = (float(v) for v in args.aoq_stage.split(','))
     damp = (OOQ(model, args.ooq_lambda, args.epochs,
                 lam_start=args.ooq_lambda_start,
                 anneal_start=args.ooq_anneal_start) if args.ooq else
+            QVR(model, args.qvr_lambda, args.epochs,
+                lam_start=args.qvr_lambda_start,
+                form=args.qvr_form) if args.qvr else
             AOQ(model, args.epochs, stage1=s1, stage2=s2,
                 alpha_min=args.aoq_alpha_min,
                 damp_lam=args.aoq_lambda) if args.aoq else None)
