@@ -26,6 +26,7 @@ making the penalty vanish without making the model any more robust.
 import math
 
 from ..modules import QConv2d, QLinear
+from .spread import spread
 
 
 class QVR:
@@ -63,6 +64,4 @@ class QVR:
 
     @staticmethod
     def _term(m):
-        u, s = m.wq.u_cache
-        spread = s * (math.pi * u).sin().abs()
-        return (spread * m.weight.grad.detach()).square().sum()
+        return (spread(m) * m.weight.grad.detach()).square().sum()

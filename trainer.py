@@ -130,6 +130,10 @@ parser.add_argument('--saq-cont', default='bn,bias', type=str, metavar='LIST',
                          'separated from bn,bias,wscale,ascale; empty perturbs the '
                          'quantized weights only. The default matches the reference '
                          '(include_bn=True, both clips off)')
+parser.add_argument('--saq-t', default='i', choices=['i', 'grid'],
+                    help='metric the SAQ ball is round in: i = isotropic (the '
+                         'reference), grid = T=diag(m), opening the ball only '
+                         'along coordinates rounding can flip (default: i)')
 parser.add_argument('--ooq', action='store_true',
                     help='OOQ: oscillation dampening, a quadratic pull onto the grid')
 parser.add_argument('--ooq-lambda', default=0.1, type=float, metavar='L',
@@ -256,7 +260,7 @@ def main():
     assert not (args.dsam and args.saq), 'pick one of --dsam / --saq'
     sam = (DiscreteSAM(model, rho=args.dsam_rho,
                        cont=filter(None, args.dsam_cont.split(','))) if args.dsam else
-           SAQ(model, rho=args.saq_rho,
+           SAQ(model, rho=args.saq_rho, t=args.saq_t,
                cont=filter(None, args.saq_cont.split(','))) if args.saq else None)
     assert sum(map(bool, (args.ooq, args.qvr, args.aoq))) <= 1, \
         'pick one of --ooq / --qvr / --aoq'
