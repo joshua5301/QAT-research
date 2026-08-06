@@ -37,7 +37,8 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import convert, quant_param_groups, QuantSAM, Dampen, OscProbe
+from quant import (convert, quant_param_groups, DiscreteSAM, SAQ, OOQ, AOQ,
+                   FlipProbe)
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -103,45 +104,51 @@ parser.add_argument('--q-init', default='lsq', choices=['lsq', 'minmax'],
                          '(default: lsq)')
 parser.add_argument('--q-step-lr-scale', default=1.0, type=float, metavar='F',
                     help='LR multiplier for the LSQ step sizes (default: 1.0)')
-parser.add_argument('--sam', action='store_true',
-                    help='QuantSAM: ascent by flipping rounding decisions')
-parser.add_argument('--sam-budget', default='cost', choices=['cost', 'gain', 'count'],
-                    help='radius of which ball --sam-rho is: cost = plain l2 (T=I), '
-                         'gain = its dual, a first-order loss budget, '
-                         'count = l2 after T=diag(m), i.e. rho^2 flips ranked by '
-                         'gain (default: cost)')
-parser.add_argument('--sam-rho', default=0.05, type=float, metavar='R',
-                    help='SAM budget, read per --sam-budget (default: 0.05)')
-parser.add_argument('--dampen', action='store_true',
-                    help='quadratic pull on the latent weights, see --damp-target')
-parser.add_argument('--damp-target', default='grid', choices=['grid', 'boundary'],
-                    help='what the penalty is minimal on: grid = oscillation '
-                         'dampening, boundary = its reflection, the T=diag(m) '
-                         'shadow of the count arm; a negative --damp-lambda '
-                         'flips either into its opposite (default: grid)')
-parser.add_argument('--damp-lambda', default=1e-4, type=float, metavar='L',
-                    help='dampening weight at the end of training; the penalty is '
-                         'summed, so retune per model size, and watch clip in the '
-                         'probe log -- clipping zeroes the penalty (default: 1e-4)')
-parser.add_argument('--damp-lambda-start', default=0.0, type=float, metavar='L',
-                    help='dampening weight at epoch 0; cosine ramp to --damp-lambda '
-                         '(default: 0.0)')
-parser.add_argument('--osc-probe', action='store_true',
-                    help='log oscillation frequency and amplitude')
-parser.add_argument('--osc-momentum', default=0.01, type=float, metavar='M',
-                    help='EMA momentum for the oscillation probe (default: 0.01)')
-parser.add_argument('--osc-out', default='', type=str, metavar='PATH',
-                    help='write probe history/traces to PATH.npz for plot_osc.py')
-parser.add_argument('--osc-label', default='', type=str,
-                    help='run label used in the figures')
-parser.add_argument('--osc-fig', default='', type=str, metavar='DIR',
-                    help='also render this run figures into DIR at the end')
-parser.add_argument('--osc-trace-epochs', default=5, type=int, metavar='N',
-                    help='trace the rounded levels over the last N epochs (default: 5)')
-parser.add_argument('--osc-trace-layer', default=-1, type=int, metavar='I',
-                    help='quantized layer to trace; -1 picks the middle one')
-parser.add_argument('--osc-top-k', default=5, type=int, metavar='K',
-                    help='oscillating weights to draw in the trace figure (default: 5)')
+parser.add_argument('--ewgs', default=0.0, type=float, metavar='D',
+                    help='EWGS gradient scaling delta, in grid units where the '
+                         'rounding error spans +-0.5; 0 keeps the plain STE, '
+                         '2 is the largest value that keeps the scale '
+                         'non-negative (default: 0.0)')
+parser.add_argument('--dsam', action='store_true',
+                    help='DiscreteSAM: ascent by flipping rounding decisions')
+parser.add_argument('--dsam-rho', default=0.05, type=float, metavar='R',
+                    help='first-order loss increase the ascent buys, in nats; '
+                         'independent of step size and bit width (default: 0.05)')
+parser.add_argument('--saq', action='store_true',
+                    help='SAQ: SAM with the perturbation on the quantized weights')
+parser.add_argument('--saq-rho', default=0.05, type=float, metavar='R',
+                    help='l2 radius of the SAQ ball. The reference uses 0.4, but on '
+                         'weight-normalized weights, so it does not carry over '
+                         'directly to raw LSQ (default: 0.05)')
+parser.add_argument('--saq-cont', default='bn,bias', type=str, metavar='LIST',
+                    help='continuous parameter groups inside the SAQ ball, comma '
+                         'separated from bn,bias,wscale,ascale; empty perturbs the '
+                         'quantized weights only. The default matches the reference '
+                         '(include_bn=True, both clips off)')
+parser.add_argument('--ooq', action='store_true',
+                    help='OOQ: oscillation dampening, a quadratic pull onto the grid')
+parser.add_argument('--ooq-lambda', default=0.1, type=float, metavar='L',
+                    help='dampening weight at the end of training, on the '
+                         'published scale (the paper anneals 0 -> 0.1) (default: 0.1)')
+parser.add_argument('--ooq-lambda-start', default=0.0, type=float, metavar='L',
+                    help='dampening weight before the ramp starts (default: 0.0)')
+parser.add_argument('--ooq-anneal-start', default=0.25, type=float, metavar='F',
+                    help='fraction of training held at --ooq-lambda-start before '
+                         'the cosine ramp begins (default: 0.25, as released)')
+parser.add_argument('--aoq', action='store_true',
+                    help='AOQ: contract the grid to explore, release, then dampen')
+parser.add_argument('--aoq-stage', default='0.2,0.6', type=str, metavar='F1,F2',
+                    help='stage boundaries as fractions of --epochs; the reference '
+                         'uses epochs 50 and 150 of 250 (default: 0.2,0.6)')
+parser.add_argument('--aoq-alpha-min', default=0.3, type=float, metavar='A',
+                    help='grid contraction at the end of the explore stage '
+                         '(default: 0.3, as the reference cosine bottoms out)')
+parser.add_argument('--aoq-lambda', default=0.01, type=float, metavar='L',
+                    help='dampening weight during the last stage (default: 0.01)')
+parser.add_argument('--flip-probe', action='store_true',
+                    help='report per layer where the DiscreteSAM flips land')
+parser.add_argument('--flip-out', default='', type=str, metavar='PATH',
+                    help='write per-epoch per-layer flip counts to PATH.npz')
 
 # cifar100 values are taken verbatim from the recipe that produced the
 # pytorch-cifar-models pretrained weights (conf/cifar100.conf).
@@ -213,7 +220,8 @@ def main():
                 first_last_bits=args.q_first_last_bits,
                 per_channel=args.q_per_channel,
                 a_signed=args.a_signed,
-                init_mode=args.q_init)
+                init_mode=args.q_init,
+                ewgs=args.ewgs)
         model.cuda()
 
     # define loss function (criterion) and optimizer
@@ -226,21 +234,23 @@ def main():
                                 nesterov=True)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    sam = QuantSAM(model, rho=args.sam_rho,
-                   budget=args.sam_budget) if args.sam else None
-    damp = Dampen(model, args.damp_lambda, args.epochs,
-                  lam_start=args.damp_lambda_start,
-                  target=args.damp_target) if args.dampen else None
-    probe = OscProbe(
-        model, momentum=args.osc_momentum,
-        trace_steps=args.osc_trace_epochs * len(train_loader),
-        trace_layer=None if args.osc_trace_layer < 0 else args.osc_trace_layer,
-    ) if args.osc_probe else None
+    assert not (args.dsam and args.saq), 'pick one of --dsam / --saq'
+    sam = (DiscreteSAM(model, rho=args.dsam_rho) if args.dsam else
+           SAQ(model, rho=args.saq_rho,
+               cont=filter(None, args.saq_cont.split(','))) if args.saq else None)
+    assert not (args.ooq and args.aoq), 'pick one of --ooq / --aoq'
+    s1, s2 = (float(v) for v in args.aoq_stage.split(','))
+    damp = (OOQ(model, args.ooq_lambda, args.epochs,
+                lam_start=args.ooq_lambda_start,
+                anneal_start=args.ooq_anneal_start) if args.ooq else
+            AOQ(model, args.epochs, stage1=s1, stage2=s2,
+                alpha_min=args.aoq_alpha_min,
+                damp_lam=args.aoq_lambda) if args.aoq else None)
+    probe = FlipProbe(model) if args.flip_probe else None
 
-    if probe is not None:
-        for p in filter(None, (args.osc_out, args.osc_fig and
-                               os.path.join(args.osc_fig, 'x'))):
-            check_writable(p)
+    assert probe is None or args.dsam, '--flip-probe needs --dsam'
+    if probe is not None and args.flip_out:
+        check_writable(args.flip_out)
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -251,10 +261,15 @@ def main():
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
+        if args.aoq:
+            damp.set_epoch(epoch)
+            print('aoq: stage {}  alpha {:.4f}'
+                  .format(damp.stage(epoch), damp.alpha(epoch)))
         train(train_loader, model, criterion, optimizer, epoch, sam, probe, damp)
         lr_scheduler.step()
         if probe is not None:
             probe.snapshot()
+            print(probe.report())
 
         # evaluate on validation set; top-5 is reported at the best top-1
         # epoch, so that both numbers describe the same model
@@ -264,25 +279,10 @@ def main():
         print(' * best so far  Prec@1 {:.3f}  Prec@5 {:.3f}'
               .format(best_prec1, best_prec5))
 
-    if probe is not None and args.osc_out:
-        label = args.osc_label or os.path.splitext(os.path.basename(args.osc_out))[0]
-        out = args.osc_out
-        try:
-            probe.save(out, label=label)
-        except OSError as e:
-            out = os.path.basename(args.osc_out)
-            print('!! {} failed ({}), falling back to {}'.format(args.osc_out, e, out))
-            probe.save(out, label=label)
-        print('=> wrote oscillation probe to {}'.format(out))
-        if args.osc_fig:
-            try:
-                from plot_osc import make_figures
-                run = (label, np.load(out, allow_pickle=True))
-                for p in make_figures([run], args.osc_fig, prefix=label + '_',
-                                      n_show=args.osc_top_k):
-                    print('=> {}'.format(p))
-            except Exception as e:
-                print('!! figures failed ({}); replot from {}'.format(e, out))
+    if probe is not None and args.flip_out:
+        probe.save(args.flip_out,
+                   label=os.path.splitext(os.path.basename(args.flip_out))[0])
+        print('=> wrote flip counts to {}'.format(args.flip_out))
 
     print(' * final  Prec@1 {:.3f}  Prec@5 {:.3f}'.format(prec1, prec5))
     print(' * best   Prec@1 {:.3f}  Prec@5 {:.3f}'.format(best_prec1, best_prec5))
@@ -319,16 +319,18 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-        # before the dampening gradient, so the probe sees the task loss only
-        osc = probe.step() if probe is not None else None
         if sam is not None:
             # meters keep the clean-weight loss from the first pass
             sam.ascent_step()
+            if probe is not None:
+                probe.step()
             optimizer.zero_grad()
             criterion(model(input_var), target_var).backward()
             sam.restore()
         if damp is not None:
-            damp.penalty(epoch).backward()
+            p = damp.penalty(epoch)
+            if p is not None:
+                p.backward()
         optimizer.step()
 
         output = output.float()
@@ -353,10 +355,8 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1, top5=top5))
             if damp is not None:
-                print('    damp: lambda {:.4g}  penalty {:.5f}'
+                print('    damp: lambda {:.4g}  penalty {:.5g}'
                       .format(damp.weight(epoch), float(damp.last)))
-            if osc is not None:
-                print('    ' + OscProbe.format(osc))
 
 
 def validate(val_loader, model, criterion):

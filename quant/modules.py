@@ -2,6 +2,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def freeze_bn(model, on):
+    """Both SAM passes see the same batch; without this the running stats are
+    updated twice and biased toward the perturbed weights."""
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            if on:
+                m._sam_mom = m.momentum
+            m.momentum = 0.0 if on else m._sam_mom
+
+
 class _SamHook:
     """Retain the grad of Q(w) on pass 1, add the flip epsilon on pass 2."""
 
@@ -20,7 +30,7 @@ class QConv2d(_SamHook, nn.Conv2d):
         super(QConv2d, self).__init__(*args, **kwargs)
         self.wq = None
         self.aq = None
-        self.sam = False        # GridSAM hooks below; plain attrs, not state
+        self.sam = False        # SAM hooks below; plain attrs, not state
         self.eps = None         # added after quantization on the 2nd pass
         self.wq_out = None      # Q(w) with a retained grad from the 1st pass
 

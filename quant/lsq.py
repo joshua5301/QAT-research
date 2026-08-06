@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn as nn
 
+from .ewgs import ewgs_pass
+
 
 def grad_scale(x, s):
     """
@@ -47,7 +49,9 @@ class LsqQuantizer(nn.Module):
         self.signed = 1 if (is_weight or signed_mode == 'always') else 0
         self._ready = False
 
-        self.cache_round = False    # GridSAM needs (u, step) from the forward
+        self.alpha = 1.0            # AOQ contracts the grid through this
+        self.ewgs = 0.0            # EWGS delta; 0 keeps the plain STE
+        self.cache_round = False    # DiscreteSAM needs (u, step) from the forward
         self.round_cache = None
         self.cache_u = False        # dampening needs u with the grid held fixed
         self.u_cache = None
@@ -93,7 +97,7 @@ class LsqQuantizer(nn.Module):
         n_elem = x.numel() if (self.is_weight and not self.per_channel) else x[0].numel()
         g = 1.0 / math.sqrt(n_elem * self.Qp)
 
-        s = grad_scale(self.s.abs().clamp(min=1e-8), g)
+        s = grad_scale(self.s.abs().clamp(min=1e-8), g) * self.alpha
         if self.per_channel:
             s = s.view(-1, *([1] * (x.dim() - 1)))
 
@@ -101,5 +105,6 @@ class LsqQuantizer(nn.Module):
         if self.cache_round:
             self.round_cache = (u.detach(), s.detach())
         if self.cache_u:
-            self.u_cache = (x / s.detach()).clamp(self.Qn, self.Qp)
-        return round_pass(u) * s
+            self.u_cache = ((x / s.detach()).clamp(self.Qn, self.Qp), s.detach())
+        v = round_pass(u) if not self.ewgs else ewgs_pass(u, self.ewgs)
+        return v * s

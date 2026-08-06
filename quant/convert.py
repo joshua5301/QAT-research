@@ -4,7 +4,7 @@ from .lsq import LsqQuantizer
 from .modules import QConv2d, QLinear
 
 def convert(model, w_bits=4, a_bits=4, first_last_bits=8,
-            per_channel=True, a_signed='auto', init_mode='lsq'):
+            per_channel=True, a_signed='auto', init_mode='lsq', ewgs=0.0):
     """
     Replace every Conv2d/Linear with its quantized counterpart, in place.
     """
@@ -38,8 +38,11 @@ def convert(model, w_bits=4, a_bits=4, first_last_bits=8,
                               num_channels=mod.weight.shape[0] if per_channel else None,
                               init_mode=init_mode)
             wq.init_from(mod.weight)
+            wq.ewgs = ewgs
         aq = (LsqQuantizer(ab, is_weight=False, signed_mode=a_signed,
                            init_mode=init_mode) if ab else None)
+        if aq is not None:
+            aq.ewgs = ewgs
 
         cls = QConv2d if isinstance(mod, nn.Conv2d) else QLinear
         parent, attr = parent_of(model, name)
