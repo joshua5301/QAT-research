@@ -26,7 +26,7 @@ import torch
 
 from ..modules import QConv2d, QLinear, freeze_bn
 from .cont import CONT, DEFAULT, continuous_params
-from .spread import spread
+from .spread import spread, spread_cont
 
 
 class SAQ:
@@ -41,11 +41,19 @@ class SAQ:
               coordinates rounding can actually flip, and its first-order
               surrogate is L(Q(w)) + rho ||m * g||, i.e. the QVR penalty --
               the same object arrived at from the ball rather than from the
-              variance. Continuous parameters keep t = 1, having no grid
+              variance. Continuous parameters take m = pi |w|, the Delta ->
+              infinity limit of the same expression, so one operator and one
+              rho cover both blocks and the penalty splits orthogonally into
+              rounding spread plus ASAM sharpness
 
     In both cases eps = rho T^2 g / ||T g||, the maximizer over
     ||T^-1 eps||_2 <= rho, so T = I gives the reference expression back
-    unchanged.
+    unchanged -- SAQ is this operator degenerated to T -> I, blind to both
+    position and scale.
+
+    Watch `share`: T_bn = pi |gamma| ~ 3 against T_quant <= Delta means the
+    continuous block can swallow the ball whenever Delta is small, i.e. at
+    higher bit widths, and the unified knob quietly becomes BN-only SAM.
     """
 
     CONT = CONT
@@ -68,6 +76,7 @@ class SAQ:
 
         self.cont = continuous_params(model, cont)
         self._backup = []
+        self.share = {}
 
     @torch.no_grad()
     def ascent_step(self):
@@ -75,18 +84,26 @@ class SAQ:
                    for m in self.layers), 'ascent_step() needs a backward pass first'
         qg = [m.wq_out.grad for m in self.layers]
         cg = [(p, p.grad) for p in self.cont if p.grad is not None]
-        tq = [spread(m) if self.t == 'grid' else None for m in self.layers]
+        grid = self.t == 'grid'
+        tq = [spread(m) if grid else None for m in self.layers]
+        tc = [spread_cont(p) if grid else None for p, _ in cg]
 
-        norm = torch.norm(torch.stack(
-            [(g if t is None else t * g).norm() for t, g in zip(tq, qg)] +
-            [g.norm() for _, g in cg]))
+        nq = [(g if t is None else t * g).norm() for t, g in zip(tq, qg)]
+        nc = [(g if t is None else t * g).norm() for t, (_, g) in zip(tc, cg)]
+        norm = torch.norm(torch.stack(nq + nc)) if nq or nc else None
         scale = self.rho / (norm + 1e-12)
 
         for m, g, t in zip(self.layers, qg, tq):
             m.eps = (g if t is None else t.square() * g) * scale
         self._backup = [(p, p.data.clone()) for p, _ in cg]
-        for p, g in cg:
-            p.add_(g * scale)
+        for (p, g), t in zip(cg, tc):
+            p.add_((g if t is None else t.square() * g) * scale)
+
+        # which block the ball actually opened along
+        eq = float(sum(n.square() for n in nq)) if nq else 0.0
+        ec = float(sum(n.square() for n in nc)) if nc else 0.0
+        tot = eq + ec
+        self.share = {'quant': eq / tot, 'cont': ec / tot} if tot else {}
 
         freeze_bn(self.model, True)
 

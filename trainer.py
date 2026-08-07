@@ -37,8 +37,8 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models
-from quant import (convert, quant_param_groups, DiscreteSAM, SAQ, OOQ, QVR,
-                   AOQ, FlipProbe)
+from quant import (convert, quant_param_groups, DiscreteSAM, SAQ, ContSAM,
+                   OOQ, QVR, AOQ, FlipProbe)
 
 # Factories are named "<dataset>_<arch>" (e.g. cifar100_resnet20); the arch set
 # is identical for both datasets, so derive it from the cifar100_ prefix.
@@ -134,6 +134,18 @@ parser.add_argument('--saq-t', default='i', choices=['i', 'grid'],
                     help='metric the SAQ ball is round in: i = isotropic (the '
                          'reference), grid = T=diag(m), opening the ball only '
                          'along coordinates rounding can flip (default: i)')
+parser.add_argument('--csam', action='store_true',
+                    help='ContSAM: SAM on the continuous parameters only, the '
+                         'control for whether the quantized half does anything')
+parser.add_argument('--csam-rho', default=0.05, type=float, metavar='R',
+                    help='l2 radius of the ContSAM ball (default: 0.05)')
+parser.add_argument('--csam-cont', default='bn', type=str, metavar='LIST',
+                    help='groups to perturb, comma separated from '
+                         'bn,bias,wscale,ascale; bn,bias matches the SAQ '
+                         'continuous block exactly (default: bn)')
+parser.add_argument('--csam-t', default='i', choices=['i', 'grid'],
+                    help='metric, matching --saq-t: i = plain SAM, '
+                         'grid = T=pi|w|, i.e. ASAM (default: i)')
 parser.add_argument('--ooq', action='store_true',
                     help='OOQ: oscillation dampening, a quadratic pull onto the grid')
 parser.add_argument('--ooq-lambda', default=0.1, type=float, metavar='L',
@@ -257,11 +269,14 @@ def main():
                                 nesterov=True)
 
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    assert not (args.dsam and args.saq), 'pick one of --dsam / --saq'
+    assert sum(map(bool, (args.dsam, args.saq, args.csam))) <= 1, \
+        'pick one of --dsam / --saq / --csam'
     sam = (DiscreteSAM(model, rho=args.dsam_rho,
                        cont=filter(None, args.dsam_cont.split(','))) if args.dsam else
            SAQ(model, rho=args.saq_rho, t=args.saq_t,
-               cont=filter(None, args.saq_cont.split(','))) if args.saq else None)
+               cont=filter(None, args.saq_cont.split(','))) if args.saq else
+           ContSAM(model, rho=args.csam_rho, t=args.csam_t,
+                   cont=filter(None, args.csam_cont.split(','))) if args.csam else None)
     assert sum(map(bool, (args.ooq, args.qvr, args.aoq))) <= 1, \
         'pick one of --ooq / --qvr / --aoq'
     s1, s2 = (float(v) for v in args.aoq_stage.split(','))
@@ -385,6 +400,9 @@ def train(train_loader, model, criterion, optimizer, epoch, sam=None, probe=None
             if damp is not None:
                 print('    damp: lambda {:.4g}  penalty {:.5g}'
                       .format(damp.weight(epoch), float(damp.last)))
+            if getattr(sam, 'share', None):
+                print('    ball: quant {quant:.4f}  cont {cont:.4f}'
+                      .format(**sam.share))
 
 
 def validate(val_loader, model, criterion):
